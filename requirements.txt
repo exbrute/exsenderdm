@@ -1,0 +1,4 @@
+telethon>=1.36.0
+python-dotenv>=1.0.0
+python-telegram-bot[socks]>=21.6
+PySocks>=1.7.1
