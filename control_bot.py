@@ -33,6 +33,7 @@ from telegram.ext import (
 from report_queue import drain_reports_forever, enqueue_report
 from proxy_util import parse_proxy
 from telethon_accounts import connect_client_with_fallback, make_telethon_client, session_path
+from account_profile import apply_account_profile_onboarding, profile_bio_from_env
 from contact_pool_util import (
     pool_panel_body,
     pool_stats_line,
@@ -331,6 +332,19 @@ def _schedule_auto_sync_contacts(
     asyncio.create_task(_auto_sync_contacts(context, aid, notify=notify))
 
 
+async def _apply_profile_on_add(aid: str, client) -> str:
+    """Bio + приватность «для всех» после добавления аккаунта."""
+    ok, detail = await apply_account_profile_onboarding(client)
+    bio = profile_bio_from_env()
+    if ok:
+        return (
+            f"\n📝 О себе: <code>{_esc(bio)}</code> · видимость <b>для всех</b>."
+        )
+    logger.warning("profile onboard [%s]: %s", aid, detail)
+    enqueue_report(aid, f"⚠️ Не удалось сменить bio: {_esc(detail)}")
+    return f"\n⚠️ Bio не изменено: {_esc(detail)}."
+
+
 async def _telethon_ready(tc) -> bool:
     if tc is None or not tc.is_connected():
         return False
@@ -375,11 +389,12 @@ async def _after_telethon_sign_in(
     context.bot_data["telethon_client"] = client
     _persist(context)
     on = await _telethon_ready(client)
+    profile_line = await _apply_profile_on_add(aid, client)
     _schedule_auto_sync_contacts(context, aid, notify=True)
     ht, kb = await _home_text_kb(multi.accounts[aid], on, context)
     await update.message.reply_text(
         f"✅ Вход выполнен: <code>{_esc(aid)}</code> "
-        f"(@{_esc(me.username or str(me.id))}).\n\n{ht}",
+        f"(@{_esc(me.username or str(me.id))}).{profile_line}\n\n{ht}",
         reply_markup=kb,
         parse_mode=PARSE,
     )
@@ -2793,10 +2808,13 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         _persist(context)
         me = await client.get_me()
         on = await _telethon_ready(client)
+        profile_line = await _apply_profile_on_add(aid, client)
+        _schedule_auto_sync_contacts(context, aid, notify=True)
         ht, kb = await _home_text_kb(context.bot_data["state"], on, context)
         suffix = "" if aid == raw_aid else f" (id слота: <code>{_esc(aid)}</code>)"
         await msg.reply_text(
-            f"✅ Сессия импортирована{suffix}. Аккаунт: @{_esc(me.username or str(me.id))}.\n\n{ht}",
+            f"✅ Сессия импортирована{suffix}. Аккаунт: @{_esc(me.username or str(me.id))}."
+            f"{profile_line}\n\n{ht}",
             reply_markup=kb,
             parse_mode=PARSE,
         )
@@ -2872,10 +2890,12 @@ async def _connect_imported_slot(
     _persist(context)
     me = await client.get_me()
     on = await _telethon_ready(client)
+    profile_line = await _apply_profile_on_add(aid, client)
     _schedule_auto_sync_contacts(context, aid, notify=True)
     ht, kb = await _home_text_kb(multi.accounts[aid], on, context)
     await msg.reply_text(
-        f"{success_prefix} @{_esc(me.username or str(me.id))} · слот <code>{_esc(aid)}</code>.\n\n{ht}",
+        f"{success_prefix} @{_esc(me.username or str(me.id))} · слот <code>{_esc(aid)}</code>."
+        f"{profile_line}\n\n{ht}",
         reply_markup=kb,
         parse_mode=PARSE,
     )
