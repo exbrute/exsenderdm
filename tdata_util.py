@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import tempfile
@@ -48,6 +49,18 @@ def extract_upload_to_temp(file_path: str) -> Path:
     return dest
 
 
+def _load_tdesktop(td_path: str, passcode: str) -> TDesktop:
+    try:
+        tdesk = TDesktop(td_path, passcode=passcode)
+    except TDataWrongPasscode as e:
+        raise TDataNeedPasscode() from e
+    except Exception as e:
+        raise TDataImportError(f"Не удалось прочитать tdata: {type(e).__name__}") from e
+    if not tdesk.isLoaded() or not tdesk.accounts:
+        raise TDataImportError("В tdata нет аккаунтов или файл повреждён.")
+    return tdesk
+
+
 async def import_tdata_to_session(
     tdata_dir: str | Path,
     session_base: str | Path,
@@ -55,6 +68,7 @@ async def import_tdata_to_session(
     api_id: int,
     api_hash: str,
     passcode: str | None = None,
+    timeout_sec: float = 180.0,
 ) -> None:
     """
     Конвертировать tdata → файл сессии Telethon (session_base без .session).
@@ -62,17 +76,6 @@ async def import_tdata_to_session(
     td_path = Path(tdata_dir)
     if not td_path.is_dir():
         raise TDataImportError("Каталог tdata не найден.")
-
-    api = API.TelegramDesktop.Generate(system="windows")
-    try:
-        tdesk = TDesktop(str(td_path), passcode=passcode or "")
-    except TDataWrongPasscode as e:
-        raise TDataNeedPasscode() from e
-    except Exception as e:
-        raise TDataImportError(f"Не удалось прочитать tdata: {type(e).__name__}") from e
-
-    if not tdesk.isLoaded() or not tdesk.accounts:
-        raise TDataImportError("В tdata нет аккаунтов или файл повреждён.")
 
     session_stem = str(session_base)
     if session_stem.endswith(".session"):
@@ -84,22 +87,33 @@ async def import_tdata_to_session(
         if os.path.isfile(cand):
             os.remove(cand)
 
-    client = await OpenTeleClient.FromTDesktop(
-        tdesk,
-        session=session_stem,
-        api=api,
-    )
-    try:
-        await client.connect()
-        if not await client.is_user_authorized():
-            raise TDataImportError("Сессия из tdata не авторизована.")
-    finally:
+    async def _run() -> None:
+        tdesk = await asyncio.to_thread(
+            _load_tdesktop, str(td_path), passcode or ""
+        )
+        api = API.TelegramDesktop.Generate(system="windows")
+        client = await OpenTeleClient.FromTDesktop(
+            tdesk,
+            session=session_stem,
+            api=api,
+        )
         try:
-            await client.disconnect()
-        except Exception:
-            pass
+            await client.connect()
+            if not await client.is_user_authorized():
+                raise TDataImportError("Сессия из tdata не авторизована.")
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
 
-    # opentele пишет sqlite-сессию; дальше используем обычный Telethon с API_ID/API_HASH из .env
+    try:
+        await asyncio.wait_for(_run(), timeout=timeout_sec)
+    except asyncio.TimeoutError as e:
+        raise TDataImportError(
+            f"Импорт tdata занял больше {int(timeout_sec)} с — прервано."
+        ) from e
+
     _ = api_id
     _ = api_hash
 

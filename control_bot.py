@@ -1882,7 +1882,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             if online and tc is not None:
                 rows = await _rows_for_sources_ui(
-                    context, force=data.startswith("rchats")
+                    context, force_refresh_titles=data.startswith("rchats")
                 )
             else:
                 rows = _ls_rows_sync(state)
@@ -2430,6 +2430,11 @@ async def _try_tdata_import_zip(
 ) -> bool:
     """True если импорт завершён (успех или фatal ошибка с сообщением)."""
     import zipfile
+
+    status = await msg.reply_text(
+        f"⏳ Импорт tdata в слот <code>{_esc(aid)}</code>… (до 3 мин)",
+        parse_mode=PARSE,
+    )
 
     multi: MultiAccountState = context.bot_data["multi"]
     extract_dir = os.path.join(os.path.dirname(__file__), "tdata_uploads", aid)
