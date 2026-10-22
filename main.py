@@ -5,6 +5,7 @@ import os
 from dotenv import load_dotenv
 from telethon import TelegramClient
 
+from contact_pool_util import sync_session_contacts_to_pool
 from spam_scheduler import start_spam_loop_background
 from state import load_multi_account_state, save_multi_account_state
 from telethon_accounts import connect_client_with_fallback, make_telethon_client
@@ -113,6 +114,21 @@ async def main() -> None:
             authorized_at_boot.add(aid)
             me = await client.get_me()
             logger.info("Userbot [%s] запущен @%s (%s)", aid, me.username or "-", me.id)
+            try:
+                added, total = await sync_session_contacts_to_pool(
+                    client,
+                    multi,
+                    lambda: save_multi_account_state(multi),
+                    account_id=aid,
+                )
+                logger.info(
+                    "Пул контактов при старте [%s]: +%s, в очереди %s",
+                    aid,
+                    added,
+                    total,
+                )
+            except Exception:
+                logger.exception("Скан контактов при старте [%s]", aid)
         else:
             logger.warning(
                 "Userbot [%s]: нет авторизации — в боте: Аккаунты → нажмите этот слот.",

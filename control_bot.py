@@ -33,6 +33,11 @@ from telegram.ext import (
 from report_queue import drain_reports_forever, enqueue_report
 from proxy_util import parse_proxy
 from telethon_accounts import connect_client_with_fallback, make_telethon_client, session_path
+from contact_pool_util import (
+    pool_panel_body,
+    pool_stats_line,
+    sync_session_contacts_to_pool,
+)
 from tdata_util import (
     TDataImportError,
     TDataNeedPasscode,
@@ -147,7 +152,7 @@ def _chats_intro_long(context: ContextTypes.DEFAULT_TYPE) -> str:
         "<b>🔗 Вступить по ссылке</b> — вступить в группу (если ещё не внутри); "
         "группа добавится в список источников.\n"
         "Строка: ✅/❌ — вкл/выкл источник · <b>📋</b> — <b>парс в очередь</b> (этот чат) · ⚙ — полные настройки.\n"
-        "<b>📇 Контакты → общий пул</b> — адресная книга текущей сессии в общую очередь (между слотами).\n"
+        "<b>📇 Контакты</b> — в общий пул попадают <b>автоматически</b> (вход / смена слота / «📇 Пул»).\n"
         "<b>Кнопка «Из ЛС»</b> — пользователи из личных диалогов в очередь <b>первого</b> источника с ✅.\n"
         "<b>В ⚙</b> — «Из 15k сообщений»: отправители из последних сообщений этой группы.\n"
         "Уже кому писали — в очередь не попадают; при отправке снимаются из очереди.\n"
@@ -184,9 +189,10 @@ async def _home_text_kb(
                     [[InlineKeyboardButton("👤 Аккаунты", callback_data="accpick")]]
                 ),
             )
-    aid = context.bot_data["multi"].active_account_id
-    text = main_panel_text(state, online, account_id=aid)
-    return text, main_kb(state)
+    multi = context.bot_data["multi"]
+    aid = multi.active_account_id
+    text = main_panel_text(state, online, account_id=aid, multi=multi)
+    return text, main_kb(state, multi)
 
 
 async def _ls_mail_text_kb(
@@ -211,16 +217,18 @@ async def _ls_mail_text_kb(
         f"Статус: <b>{sp}</b>\n"
         f"Источников с ✅: <b>{n_on}</b> · в очереди источников: <b>{pend}</b>\n"
         f"<b>Общий пул</b> (контакты): {pool_on} · ждут: <b>{pool_p}</b> · уже писали: <b>{pool_s}</b>\n\n"
-        "<i>Контакты: «Парс» → «📇 Контакты → общий пул». Рассылка по пулу — кнопка ниже.</i>"
+        "<i>Контакты подтягиваются в пул автоматически. Подробнее — «📇 Пул» в меню.</i>"
     )
+    pool_p = len(multi.shared_dm_pending_user_ids or [])
     kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(label, callback_data="spam")],
             [
                 InlineKeyboardButton(
-                    f"{'⏸' if multi.shared_pool_mailing else '▶'} Пул контактов",
+                    f"{'⏸' if multi.shared_pool_mailing else '▶'} Рассылка по пулу",
                     callback_data="shpool",
-                )
+                ),
+                InlineKeyboardButton(f"📇 Пул ({pool_p})", callback_data="poolview"),
             ],
             [InlineKeyboardButton("📋 К парсу (источники)", callback_data="chats0")],
             [InlineKeyboardButton("◀ Главное меню", callback_data="home")],
@@ -283,6 +291,46 @@ def _normalize_phone(raw: str) -> str | None:
     return s
 
 
+async def _auto_sync_contacts(
+    context: ContextTypes.DEFAULT_TYPE,
+    aid: str,
+    *,
+    notify: bool = False,
+) -> tuple[int, int] | None:
+    multi: MultiAccountState = context.bot_data["multi"]
+    client = context.bot_data.get("telethon_clients", {}).get(aid)
+    if not await _telethon_ready(client):
+        return None
+    try:
+        added, total = await sync_session_contacts_to_pool(
+            client,
+            multi,
+            lambda: save_multi_account_state(multi),
+            account_id=aid,
+        )
+        if notify:
+            enqueue_report(
+                aid,
+                f"📇 <b>Контакты в пул</b> · слот <code>{_esc(aid)}</code>\n"
+                f"+<b>{added}</b> новых, в очереди: <b>{total}</b>",
+            )
+        return added, total
+    except Exception:
+        logger.exception("auto_sync_contacts [%s]", aid)
+        if notify:
+            enqueue_report(
+                aid,
+                f"⚠️ Не удалось обновить пул контактов (<code>{_esc(aid)}</code>).",
+            )
+        return None
+
+
+def _schedule_auto_sync_contacts(
+    context: ContextTypes.DEFAULT_TYPE, aid: str, *, notify: bool = False
+) -> None:
+    asyncio.create_task(_auto_sync_contacts(context, aid, notify=notify))
+
+
 async def _telethon_ready(tc) -> bool:
     if tc is None or not tc.is_connected():
         return False
@@ -327,6 +375,7 @@ async def _after_telethon_sign_in(
     context.bot_data["telethon_client"] = client
     _persist(context)
     on = await _telethon_ready(client)
+    _schedule_auto_sync_contacts(context, aid, notify=True)
     ht, kb = await _home_text_kb(multi.accounts[aid], on, context)
     await update.message.reply_text(
         f"✅ Вход выполнен: <code>{_esc(aid)}</code> "
@@ -622,7 +671,11 @@ async def _get_group_chats_cached(
 
 
 def main_panel_text(
-    state: RuntimeState, online: bool, *, account_id: str | None = None
+    state: RuntimeState,
+    online: bool,
+    *,
+    account_id: str | None = None,
+    multi: MultiAccountState | None = None,
 ) -> str:
     sp = "🟢 запущен" if state.spam_running else "⏹ остановлен"
     line = "✅ Userbot онлайн" if online else "❌ Userbot офлайн / нет сессии"
@@ -633,26 +686,58 @@ def main_panel_text(
         if account_id
         else ""
     )
+    pool_block = ""
+    if multi is not None:
+        pool_block = pool_stats_line(multi) + "\n"
     return (
         "<b>Главное меню</b>\n\n"
         f"{acc}"
         f"{line}\n"
         f"Рассылка в ЛС: {sp}\n"
         f"Источников с ✅: {n}\n"
-        "<i>Откройте <b>Парс групп</b> → кнопка <b>«Парс в очередь»</b> или 📋 у чата.</i>"
+        f"{pool_block}\n"
+        "<i>Контакты сессии → общий пул автоматически. Группы: <b>Парс групп</b>.</i>"
     )
 
 
-def main_kb(state: RuntimeState) -> InlineKeyboardMarkup:
+def main_kb(state: RuntimeState, multi: MultiAccountState) -> InlineKeyboardMarkup:
+    pool_p = len(multi.shared_dm_pending_user_ids or [])
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton("📋 Парс групп", callback_data="chats0"),
                 InlineKeyboardButton("📨 Рассылка", callback_data="lsmail"),
             ],
+            [
+                InlineKeyboardButton(
+                    f"📇 Пул ({pool_p})", callback_data="poolview"
+                ),
+            ],
             [InlineKeyboardButton("👤 Аккаунты", callback_data="accpick")],
             [InlineKeyboardButton("ЙОД", callback_data="yod")],
             [InlineKeyboardButton("Настройки", callback_data="settings")],
+        ]
+    )
+
+
+def pool_view_kb(multi: MultiAccountState) -> InlineKeyboardMarkup:
+    pool_p = len(multi.shared_dm_pending_user_ids or [])
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    f"🔄 Скан контактов ({pool_p} в пуле)",
+                    callback_data="poolscan",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    f"{'⏸' if multi.shared_pool_mailing else '▶'} Рассылка по пулу",
+                    callback_data="shpool",
+                )
+            ],
+            [InlineKeyboardButton("📨 Рассылка ЛС", callback_data="lsmail")],
+            [InlineKeyboardButton("◀ Главное меню", callback_data="home")],
         ]
     )
 
@@ -1058,6 +1143,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     context.user_data.clear()
     on = await _telethon_ready(context.bot_data.get("telethon_client"))
+    if on:
+        _schedule_auto_sync_contacts(
+            context, context.bot_data["multi"].active_account_id, notify=False
+        )
     text, kb = await _home_text_kb(state, on, context)
     await update.message.reply_text(text, reply_markup=kb, parse_mode=PARSE)
 
@@ -1302,6 +1391,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data.clear()
         state = context.bot_data["state"]
         online = await _telethon_ready(client)
+        _schedule_auto_sync_contacts(context, new_id, notify=False)
         t, kb = await _home_text_kb(state, online, context)
         await q.answer(f"Слот: {new_id}")
         await _edit_cb_message(q, text=t, reply_markup=kb, parse_mode=PARSE)
@@ -1475,6 +1565,37 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _edit_cb_message(q, text=t, reply_markup=kb, parse_mode=PARSE)
         return
 
+    if data == "poolview":
+        multi = context.bot_data["multi"]
+        await q.answer()
+        body = pool_panel_body(multi, active_slot=multi.active_account_id)
+        await _edit_cb_message(
+            q,
+            text=body,
+            reply_markup=pool_view_kb(multi),
+            parse_mode=PARSE,
+        )
+        return
+
+    if data == "poolscan":
+        aid = context.bot_data["multi"].active_account_id
+        if not online or tc is None:
+            await q.answer("Userbot офлайн.", show_alert=True)
+            return
+        await q.answer("Сканирую контакты…")
+        res = await _auto_sync_contacts(context, aid, notify=False)
+        multi = context.bot_data["multi"]
+        body = pool_panel_body(multi, active_slot=aid)
+        if res is not None:
+            body += f"\n\n✅ +<b>{res[0]}</b> новых, в очереди: <b>{res[1]}</b>."
+        await _edit_cb_message(
+            q,
+            text=body,
+            reply_markup=pool_view_kb(multi),
+            parse_mode=PARSE,
+        )
+        return
+
     if data == "shpool":
         multi = context.bot_data["multi"]
         multi.shared_pool_mailing = not multi.shared_pool_mailing
@@ -1483,8 +1604,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "Рассылка по общему пулу: "
             + ("включена" if multi.shared_pool_mailing else "выключена")
         )
-        t, kb = await _ls_mail_text_kb(state, online, context)
-        await _edit_cb_message(q, text=t, reply_markup=kb, parse_mode=PARSE)
+        body = pool_panel_body(multi, active_slot=multi.active_account_id)
+        await _edit_cb_message(
+            q,
+            text=body,
+            reply_markup=pool_view_kb(multi),
+            parse_mode=PARSE,
+        )
         return
 
     if data == "spam":
@@ -2746,6 +2872,7 @@ async def _connect_imported_slot(
     _persist(context)
     me = await client.get_me()
     on = await _telethon_ready(client)
+    _schedule_auto_sync_contacts(context, aid, notify=True)
     ht, kb = await _home_text_kb(multi.accounts[aid], on, context)
     await msg.reply_text(
         f"{success_prefix} @{_esc(me.username or str(me.id))} · слот <code>{_esc(aid)}</code>.\n\n{ht}",
