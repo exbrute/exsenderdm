@@ -2547,12 +2547,31 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         if not waiting_tdata:
             context.user_data["wait"] = ("accimporttdata",)
-        await _try_tdata_import_zip(msg, context, aid, tmp_zip)
-        try:
-            if os.path.isfile(tmp_zip):
-                os.remove(tmp_zip)
-        except OSError:
-            pass
+        if context.application.bot_data.get("tdata_import_busy"):
+            await msg.reply_text(
+                "Уже идёт импорт tdata — дождитесь сообщения об окончании.",
+                parse_mode=PARSE,
+            )
+            return
+
+        async def _job() -> None:
+            context.application.bot_data["tdata_import_busy"] = True
+            try:
+                await _try_tdata_import_zip(msg, context, aid, tmp_zip)
+            finally:
+                context.application.bot_data["tdata_import_busy"] = False
+                try:
+                    if os.path.isfile(tmp_zip):
+                        os.remove(tmp_zip)
+                except OSError:
+                    pass
+
+        await msg.reply_text(
+            f"📥 Архив принят. Импорт слота <code>{_esc(aid)}</code> идёт <b>в фоне</b> — "
+            "бот остаётся на связи.",
+            parse_mode=PARSE,
+        )
+        asyncio.create_task(_job())
         return
 
     if not filename.lower().endswith(".session"):
@@ -3506,8 +3525,10 @@ def build_application(
         .token(token)
         .request(req)
         .post_init(_post_init)
+        .concurrent_updates(True)
         .build()
     )
+    app.bot_data["tdata_import_busy"] = False
     app.bot_data["multi"] = multi
     app.bot_data["state"] = state
     app.bot_data["admin_ids"] = _parse_admin_ids()

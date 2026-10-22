@@ -61,6 +61,39 @@ def _load_tdesktop(td_path: str, passcode: str) -> TDesktop:
     return tdesk
 
 
+def _import_tdata_blocking(
+    tdata_dir: str,
+    session_stem: str,
+    passcode: str,
+    api_id: int,
+    api_hash: str,
+) -> None:
+    """Полный импорт в отдельном потоке (не блокирует asyncio loop бота)."""
+
+    async def _inner() -> None:
+        tdesk = _load_tdesktop(tdata_dir, passcode)
+        try:
+            api = API(int(api_id), str(api_hash))
+        except Exception:
+            api = API.TelegramDesktop.Generate(system="windows")
+        client = await OpenTeleClient.FromTDesktop(
+            tdesk,
+            session=session_stem,
+            api=api,
+        )
+        try:
+            await asyncio.wait_for(client.connect(), timeout=90.0)
+            if not await client.is_user_authorized():
+                raise TDataImportError("Сессия из tdata не авторизована.")
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+    asyncio.run(_inner())
+
+
 async def import_tdata_to_session(
     tdata_dir: str | Path,
     session_base: str | Path,
@@ -87,35 +120,22 @@ async def import_tdata_to_session(
         if os.path.isfile(cand):
             os.remove(cand)
 
-    async def _run() -> None:
-        tdesk = await asyncio.to_thread(
-            _load_tdesktop, str(td_path), passcode or ""
-        )
-        api = API.TelegramDesktop.Generate(system="windows")
-        client = await OpenTeleClient.FromTDesktop(
-            tdesk,
-            session=session_stem,
-            api=api,
-        )
-        try:
-            await client.connect()
-            if not await client.is_user_authorized():
-                raise TDataImportError("Сессия из tdata не авторизована.")
-        finally:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-
     try:
-        await asyncio.wait_for(_run(), timeout=timeout_sec)
+        await asyncio.wait_for(
+            asyncio.to_thread(
+                _import_tdata_blocking,
+                str(td_path),
+                session_stem,
+                passcode or "",
+                int(api_id),
+                str(api_hash),
+            ),
+            timeout=timeout_sec,
+        )
     except asyncio.TimeoutError as e:
         raise TDataImportError(
             f"Импорт tdata занял больше {int(timeout_sec)} с — прервано."
         ) from e
-
-    _ = api_id
-    _ = api_hash
 
 
 def cleanup_tree(path: str | Path | None) -> None:
