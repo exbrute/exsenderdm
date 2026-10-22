@@ -5,6 +5,7 @@ import os
 from dotenv import load_dotenv
 from telethon import TelegramClient
 
+from account_profile import apply_account_profile_onboarding
 from contact_pool_util import sync_session_contacts_to_pool
 from spam_scheduler import start_spam_loop_background
 from state import load_multi_account_state, save_multi_account_state
@@ -129,6 +130,14 @@ async def main() -> None:
                 )
             except Exception:
                 logger.exception("Скан контактов при старте [%s]", aid)
+            try:
+                ok, detail = await apply_account_profile_onboarding(client)
+                if ok:
+                    logger.info("Bio обновлено [%s]", aid)
+                else:
+                    logger.warning("Bio не обновлено [%s]: %s", aid, detail)
+            except Exception:
+                logger.exception("Bio при старте [%s]", aid)
         else:
             logger.warning(
                 "Userbot [%s]: нет авторизации — в боте: Аккаунты → нажмите этот слот.",
