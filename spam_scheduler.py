@@ -19,9 +19,11 @@ from telethon.errors import (
 
 from report_queue import enqueue_report
 from state import (
+    MultiAccountState,
     RuntimeState,
     effective_send_text,
     enabled_ls_source_ids,
+    pool_text_chat_id,
     random_interval_seconds,
 )
 from yod_util import yod_bot_from_env, yod_run_double_start
@@ -37,6 +39,7 @@ _FORBIDDEN_BACKOFF_SEC = 3600.0
 _PEER_FLOOD_BACKOFF_SEC = 3600.0
 _DM_SENT_CAP = 50_000
 _OPENING_GAP_SEC = 0.9
+_SHARED_POOL_SCHED_ID = -1
 
 
 async def _maybe_yod_after_peer_flood(
@@ -195,11 +198,60 @@ def _pop_pending_tail_for_uid(
     persist()
 
 
+def _next_uid_from_shared_pool(
+    multi: MultiAccountState, persist: Callable[[], None]
+) -> int | None:
+    pending = list(multi.shared_dm_pending_user_ids or [])
+    sent = set(multi.shared_dm_sent_user_ids or [])
+    changed = False
+    while pending and pending[-1] in sent:
+        pending.pop()
+        changed = True
+    if changed:
+        multi.shared_dm_pending_user_ids = pending
+        persist()
+    if not pending:
+        return None
+    return pending[-1]
+
+
+def _pop_shared_pending_uid(
+    multi: MultiAccountState, uid: int, persist: Callable[[], None]
+) -> None:
+    pending = list(multi.shared_dm_pending_user_ids or [])
+    if pending and pending[-1] == uid:
+        pending.pop()
+    elif uid in pending:
+        pending.remove(uid)
+    multi.shared_dm_pending_user_ids = pending
+    persist()
+
+
+def _mark_shared_sent(
+    multi: MultiAccountState, uid: int, persist: Callable[[], None]
+) -> None:
+    lst = list(multi.shared_dm_sent_user_ids or [])
+    if uid not in lst:
+        lst.append(uid)
+        if len(lst) > _DM_SENT_CAP:
+            lst = lst[-(_DM_SENT_CAP // 2) :]
+        multi.shared_dm_sent_user_ids = lst
+        persist()
+
+
+def _skip_shared_user(
+    multi: MultiAccountState, uid: int, persist: Callable[[], None]
+) -> None:
+    _mark_shared_sent(multi, uid, persist)
+
+
 def start_spam_loop_background(
     client: TelegramClient,
     state: RuntimeState,
     persist: Callable[[], None],
     account_key: str,
+    *,
+    multi: MultiAccountState | None = None,
 ) -> bool:
     if account_key in _spam_loop_started:
         logger.debug("spam_loop уже запущен для слота %s", account_key)
@@ -208,7 +260,13 @@ def start_spam_loop_background(
 
     async def _runner() -> None:
         try:
-            await spam_loop(client, state, persist=persist, account_key=account_key)
+            await spam_loop(
+                client,
+                state,
+                persist=persist,
+                account_key=account_key,
+                multi=multi,
+            )
         finally:
             _spam_loop_started.discard(account_key)
 
@@ -223,6 +281,7 @@ async def spam_loop(
     *,
     persist: Callable[[], None],
     account_key: str,
+    multi: MultiAccountState | None = None,
 ) -> None:
     next_fire: dict[int, float] = {}
     loop = asyncio.get_running_loop()
@@ -284,70 +343,120 @@ async def spam_loop(
 
             now = loop.time()
             ids = enabled_ls_source_ids(state)
+            pool_on = bool(
+                multi
+                and multi.shared_pool_mailing
+                and (multi.shared_dm_pending_user_ids or [])
+            )
+            sched_ids: list[int] = list(ids)
+            if pool_on:
+                sched_ids.append(_SHARED_POOL_SCHED_ID)
+
             for pid in list(next_fire.keys()):
-                if pid not in ids:
+                if pid == _SHARED_POOL_SCHED_ID:
+                    if not pool_on:
+                        del next_fire[pid]
+                elif pid not in ids:
                     del next_fire[pid]
 
-            if not ids:
+            if not sched_ids:
                 continue
 
-            for pid in ids:
+            for pid in sched_ids:
                 if pid not in next_fire:
-                    c0 = state.cfg(pid)
-                    delay_sec = max(0.0, float(c0.start_delay_sec or 0))
-                    if delay_sec > 0:
-                        next_fire[pid] = now + delay_sec
-                    else:
+                    if pid == _SHARED_POOL_SCHED_ID:
                         next_fire[pid] = now + _FIRST_FIRE_SEC
+                    else:
+                        c0 = state.cfg(pid)
+                        delay_sec = max(0.0, float(c0.start_delay_sec or 0))
+                        if delay_sec > 0:
+                            next_fire[pid] = now + delay_sec
+                        else:
+                            next_fire[pid] = now + _FIRST_FIRE_SEC
 
-            due = [pid for pid in ids if next_fire.get(pid, 0) <= now]
+            due = [pid for pid in sched_ids if next_fire.get(pid, 0) <= now]
             due.sort(key=lambda x: next_fire.get(x, 0))
 
             for source_pid in due:
                 if not state.spam_running:
                     break
-                if source_pid not in enabled_ls_source_ids(state):
+                from_pool = source_pid == _SHARED_POOL_SCHED_ID
+                if not from_pool and source_pid not in enabled_ls_source_ids(state):
                     continue
                 uid: int | None = None
+                cfg_chat = pool_text_chat_id(state) if from_pool else source_pid
                 try:
-                    cfg = state.cfg(source_pid)
-                    lim = cfg.message_limit
-                    if lim is not None and int(lim) > 0:
-                        if cfg.messages_sent >= int(lim):
-                            c2 = state.cfg(source_pid)
-                            c2.enabled = False
-                            state.set_cfg(source_pid, c2)
-                            persist()
-                            del next_fire[source_pid]
-                            report(
-                                f"✅ Лимит ЛС для источника <code>{source_pid}</code> достигнут — источник выключен."
-                            )
-                            logger.info("Лимит ЛС %s для источника %s", lim, source_pid)
-                            continue
+                    cfg = state.cfg(cfg_chat)
+                    src_label = "общий пул" if from_pool else str(source_pid)
 
-                    uid = _next_uid_from_pending_queue(state, source_pid, persist)
+                    def _after_fail_user(u: int) -> None:
+                        if from_pool and multi is not None:
+                            _skip_shared_user(multi, u, persist)
+                            _pop_shared_pending_uid(multi, u, persist)
+                        else:
+                            _skip_user(state, source_pid, u, persist)
+                            _pop_pending_tail_for_uid(state, source_pid, u, persist)
+
+                    def _after_sent_user(u: int) -> None:
+                        if from_pool and multi is not None:
+                            _mark_shared_sent(multi, u, persist)
+                            _pop_shared_pending_uid(multi, u, persist)
+                        else:
+                            c3 = state.cfg(source_pid)
+                            lst = list(c3.dm_sent_user_ids or [])
+                            if u not in lst:
+                                lst.append(u)
+                                if len(lst) > _DM_SENT_CAP:
+                                    lst = lst[-(_DM_SENT_CAP // 2) :]
+                                c3.dm_sent_user_ids = lst
+                            state.set_cfg(source_pid, c3)
+                            persist()
+                            _pop_pending_tail_for_uid(state, source_pid, u, persist)
+
+                    if not from_pool:
+                        lim = cfg.message_limit
+                        if lim is not None and int(lim) > 0:
+                            if cfg.messages_sent >= int(lim):
+                                c2 = state.cfg(source_pid)
+                                c2.enabled = False
+                                state.set_cfg(source_pid, c2)
+                                persist()
+                                del next_fire[source_pid]
+                                report(
+                                    f"✅ Лимит ЛС для источника <code>{source_pid}</code> достигнут — источник выключен."
+                                )
+                                logger.info(
+                                    "Лимит ЛС %s для источника %s", lim, source_pid
+                                )
+                                continue
+
+                    if from_pool:
+                        if multi is None:
+                            continue
+                        uid = _next_uid_from_shared_pool(multi, persist)
+                    else:
+                        uid = _next_uid_from_pending_queue(state, source_pid, persist)
                     if uid is None:
                         logger.info(
-                            "Источник %s: очередь ЛС пуста — сделайте «Парс → очередь» в ⚙ источника.",
-                            source_pid,
+                            "%s: очередь ЛС пуста.",
+                            src_label,
                         )
                         next_fire[source_pid] = loop.time() + 300.0
                         await asyncio.sleep(_GAP)
                         continue
 
-                    plan = await _resolve_send_plan(client, state, source_pid)
+                    plan = await _resolve_send_plan(client, state, cfg_chat)
                     opening = (cfg.dm_opening or "").strip()
 
                     if plan.is_forward:
                         if not plan.forward_msg_ids or plan.forward_from is None:
                             logger.warning(
                                 "Пересылка: нет сообщения в канале-источнике, пропуск %s",
-                                source_pid,
+                                src_label,
                             )
-                            _skip_user(state, source_pid, uid, persist)
-                            _pop_pending_tail_for_uid(state, source_pid, uid, persist)
+                            _after_fail_user(uid)
                             next_fire[source_pid] = loop.time() + random_interval_seconds(
-                                state, source_pid
+                                state, cfg_chat
                             )
                             continue
                         if opening:
@@ -361,11 +470,10 @@ async def spam_loop(
                     else:
                         text, entities = plan.text, plan.entities
                         if not text:
-                            logger.warning("Пустой текст, пропуск источника %s", source_pid)
-                            _skip_user(state, source_pid, uid, persist)
-                            _pop_pending_tail_for_uid(state, source_pid, uid, persist)
+                            logger.warning("Пустой текст, пропуск %s", src_label)
+                            _after_fail_user(uid)
                             next_fire[source_pid] = loop.time() + random_interval_seconds(
-                                state, source_pid
+                                state, cfg_chat
                             )
                             continue
                         if opening:
@@ -381,37 +489,29 @@ async def spam_loop(
                         else:
                             await client.send_message(uid, text)
 
-                    logger.info("ЛС отправлено user=%s из источника %s", uid, source_pid)
-                    c3 = state.cfg(source_pid)
-                    lst = list(c3.dm_sent_user_ids or [])
-                    if uid not in lst:
-                        lst.append(uid)
-                        if len(lst) > _DM_SENT_CAP:
-                            lst = lst[-(_DM_SENT_CAP // 2) :]
-                        c3.dm_sent_user_ids = lst
-                    lim2 = c3.message_limit
-                    if lim2 is not None and int(lim2) > 0:
-                        c3.messages_sent = int(c3.messages_sent or 0) + 1
-                        hit = c3.messages_sent >= int(lim2)
-                        if hit:
-                            c3.enabled = False
-                            report(
-                                f"✅ Лимит ЛС для источника <code>{source_pid}</code> достигнут — источник выключен."
-                            )
-                        state.set_cfg(source_pid, c3)
-                        persist()
-                        _pop_pending_tail_for_uid(state, source_pid, uid, persist)
-                        if hit:
-                            del next_fire[source_pid]
-                            await asyncio.sleep(_GAP)
-                            continue
-                    else:
-                        state.set_cfg(source_pid, c3)
-                        persist()
-                        _pop_pending_tail_for_uid(state, source_pid, uid, persist)
+                    logger.info("ЛС отправлено user=%s (%s)", uid, src_label)
+                    if not from_pool:
+                        c3 = state.cfg(source_pid)
+                        lim2 = c3.message_limit
+                        if lim2 is not None and int(lim2) > 0:
+                            c3.messages_sent = int(c3.messages_sent or 0) + 1
+                            hit = c3.messages_sent >= int(lim2)
+                            if hit:
+                                c3.enabled = False
+                                report(
+                                    f"✅ Лимит ЛС для источника <code>{source_pid}</code> достигнут — источник выключен."
+                                )
+                            state.set_cfg(source_pid, c3)
+                            persist()
+                            if hit:
+                                _after_sent_user(uid)
+                                del next_fire[source_pid]
+                                await asyncio.sleep(_GAP)
+                                continue
+                    _after_sent_user(uid)
 
                     next_fire[source_pid] = loop.time() + random_interval_seconds(
-                        state, source_pid
+                        state, cfg_chat
                     )
                     await asyncio.sleep(_GAP)
                     continue
@@ -439,19 +539,27 @@ async def spam_loop(
                 except (UserPrivacyRestrictedError, UserIsBlockedError) as e:
                     logger.info("Пропуск user %s: %s", uid, e)
                     if uid is not None:
-                        _skip_user(state, source_pid, uid, persist)
-                        _pop_pending_tail_for_uid(state, source_pid, uid, persist)
+                        if from_pool and multi is not None:
+                            _skip_shared_user(multi, uid, persist)
+                            _pop_shared_pending_uid(multi, uid, persist)
+                        else:
+                            _skip_user(state, source_pid, uid, persist)
+                            _pop_pending_tail_for_uid(state, source_pid, uid, persist)
                     next_fire[source_pid] = loop.time() + random_interval_seconds(
-                        state, source_pid
+                        state, cfg_chat if from_pool else source_pid
                     )
                     continue
                 except (UserDeactivatedError, InputUserDeactivatedError) as e:
                     logger.info("Деактивированный user: %s", e)
                     if uid is not None:
-                        _skip_user(state, source_pid, uid, persist)
-                        _pop_pending_tail_for_uid(state, source_pid, uid, persist)
+                        if from_pool and multi is not None:
+                            _skip_shared_user(multi, uid, persist)
+                            _pop_shared_pending_uid(multi, uid, persist)
+                        else:
+                            _skip_user(state, source_pid, uid, persist)
+                            _pop_pending_tail_for_uid(state, source_pid, uid, persist)
                     next_fire[source_pid] = loop.time() + random_interval_seconds(
-                        state, source_pid
+                        state, cfg_chat if from_pool else source_pid
                     )
                     continue
                 except Exception as e:

@@ -123,6 +123,7 @@ async def main() -> None:
             multi.accounts[aid],
             persist=lambda: save_multi_account_state(multi),
             account_key=aid,
+            multi=multi,
         )
 
     authorized_boot_frozen = frozenset(authorized_at_boot)

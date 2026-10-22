@@ -8,11 +8,65 @@ from typing import Iterable, Optional
 from telethon.tl import functions, types
 from telethon.tl.types import Channel, Chat, User
 
-from state import RuntimeState, enabled_ls_source_ids
+from state import MultiAccountState, RuntimeState, enabled_ls_source_ids
 
 _MAX_PARTICIPANTS_CHUNK = 200
 _DM_PENDING_CAP = 50_000
 _MESSAGE_SENDER_SCAN_LIMIT = 15_000
+
+
+def append_users_to_shared_pool(
+    multi: MultiAccountState,
+    persist: Callable[[], None],
+    users: Iterable[User],
+    me_id: int | None,
+) -> tuple[int, int]:
+    """Добавить пользователей в общий пул рассылки (между слотами)."""
+    sent = set(multi.shared_dm_sent_user_ids or [])
+    pending = list(multi.shared_dm_pending_user_ids or [])
+    in_pending: set[int] = set(pending)
+    added = 0
+    for u in users:
+        if len(pending) >= _DM_PENDING_CAP:
+            break
+        if getattr(u, "bot", False) or getattr(u, "deleted", False):
+            continue
+        if me_id is not None and u.id == me_id:
+            continue
+        if u.id in sent or u.id in in_pending:
+            continue
+        pending.append(u.id)
+        in_pending.add(u.id)
+        added += 1
+    multi.shared_dm_pending_user_ids = pending
+    persist()
+    return added, len(pending)
+
+
+async def parse_contacts_into_shared_pool(
+    client: TelegramClient,
+    multi: MultiAccountState,
+    persist: Callable[[], None],
+) -> tuple[int, int]:
+    """
+    Адресная книга Telegram (контакты текущей сессии) → общий пул.
+    Уже отправленные (shared_dm_sent) и уже в очереди не дублируются.
+    """
+    me = await client.get_me()
+    my_id = me.id if me else None
+    collected: list[User] = []
+    try:
+        result = await client(
+            functions.contacts.GetContactsRequest(hash=0)
+        )
+        for u in result.users:
+            if isinstance(u, User):
+                collected.append(u)
+    except Exception:
+        async for u in client.iter_contacts():
+            if isinstance(u, User):
+                collected.append(u)
+    return append_users_to_shared_pool(multi, persist, collected, my_id)
 
 
 def append_users_to_dm_pending(

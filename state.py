@@ -166,6 +166,11 @@ class MultiAccountState:
     active_account_id: str = "default"
     account_order: list[str] = field(default_factory=list)
     accounts: dict[str, RuntimeState] = field(default_factory=dict)
+    # Общий пул получателей ЛС (все слоты): контакты и др. сканы.
+    shared_dm_pending_user_ids: list[int] = field(default_factory=list)
+    shared_dm_sent_user_ids: list[int] = field(default_factory=list)
+    # Рассылка из общего пула (настройки текста/интервала — стандарт или первый ✅ источник).
+    shared_pool_mailing: bool = False
 
 
 def active_runtime_state(multi: MultiAccountState) -> RuntimeState:
@@ -311,6 +316,9 @@ def load_multi_account_state() -> MultiAccountState:
             active_account_id=active,
             account_order=order,
             accounts=accounts,
+            shared_dm_pending_user_ids=_int_list(raw.get("shared_dm_pending_user_ids")),
+            shared_dm_sent_user_ids=_int_list(raw.get("shared_dm_sent_user_ids")),
+            shared_pool_mailing=bool(raw.get("shared_pool_mailing", False)),
         )
 
     st = _runtime_state_from_flat_dict(raw)
@@ -344,6 +352,9 @@ def save_multi_account_state(multi: MultiAccountState) -> None:
             "active_account_id": multi.active_account_id,
             "account_order": list(multi.account_order),
             "accounts": {k: asdict(v) for k, v in multi.accounts.items()},
+            "shared_dm_pending_user_ids": list(multi.shared_dm_pending_user_ids or []),
+            "shared_dm_sent_user_ids": list(multi.shared_dm_sent_user_ids or []),
+            "shared_pool_mailing": bool(multi.shared_pool_mailing),
         },
         indent=2,
         ensure_ascii=False,
@@ -471,7 +482,17 @@ def chat_has_resolved_text(state: RuntimeState, chat_id: int) -> bool:
     return bool(effective_body_text(state, chat_id).strip())
 
 
-def validate_spam_start(state: RuntimeState, client_connected: bool) -> tuple[bool, str]:
+def pool_text_chat_id(state: RuntimeState) -> int:
+    """Чат настроек для рассылки из общего пула (первый ✅ источник или стандарт)."""
+    ids = enabled_ls_source_ids(state)
+    return ids[0] if ids else 0
+
+
+def validate_spam_start(
+    state: RuntimeState,
+    client_connected: bool,
+    multi: MultiAccountState | None = None,
+) -> tuple[bool, str]:
     from proxy_util import parse_proxy
 
     if not client_connected:
@@ -481,20 +502,37 @@ def validate_spam_start(state: RuntimeState, client_connected: bool) -> tuple[bo
             False,
             "Прокси указан, но формат неверный. Используйте логин:пароль@ip:порт или ip:порт.",
         )
+    pool_on = bool(
+        multi
+        and multi.shared_pool_mailing
+        and (multi.shared_dm_pending_user_ids or [])
+    )
     ids = enabled_ls_source_ids(state)
-    if not ids:
+    if not ids and not pool_on:
         return (
             False,
-            "Нет источников с ✅ — в «Парс» добавьте ссылку на группу и включите её.",
+            "Нет источников с ✅ и пустой общий пул — добавьте группу или "
+            "«📇 Контакты → общий пул» и включите рассылку по пулу.",
         )
-    for cid in ids:
-        if not (state.cfg(cid).dm_pending_user_ids or []):
+    if pool_on:
+        pid = pool_text_chat_id(state)
+        if effective_interval_sec(state, pid) <= 0:
+            return False, "Интервал для общего пула должен быть &gt; 0 сек."
+        if not chat_has_resolved_text(state, pid):
             return (
                 False,
-                "Пустая очередь ЛС для источника <code>"
-                f"{cid}</code>. Откройте «Парс» → ⚙ этого чата → "
-                "<b>Парс → очередь ЛС</b>.",
+                "Задайте текст для общего пула (стандарт в Настройках или источник с ✅).",
             )
+    for cid in ids:
+        if not (state.cfg(cid).dm_pending_user_ids or []):
+            if not pool_on:
+                return (
+                    False,
+                    "Пустая очередь ЛС для источника <code>"
+                    f"{cid}</code>. Откройте «Парс» → ⚙ этого чата → "
+                    "<b>Парс → очередь ЛС</b> или включите общий пул.",
+                )
+            continue
     if state.default_interval_sec <= 0:
         for cid in ids:
             ci = state.cfg(cid).custom_interval_sec

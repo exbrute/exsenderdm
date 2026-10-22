@@ -6,11 +6,13 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 
 from group_dialogs import (
     group_chat_title,
     list_broadcast_channels,
     list_group_chats,
+    parse_contacts_into_shared_pool,
     parse_group_members_into_pending,
     parse_ls_dialogs_users_into_pending,
     parse_recent_message_senders_into_pending,
@@ -31,6 +33,13 @@ from telegram.ext import (
 from report_queue import drain_reports_forever, enqueue_report
 from proxy_util import parse_proxy
 from telethon_accounts import connect_client_with_fallback, make_telethon_client, session_path
+from tdata_util import (
+    TDataImportError,
+    TDataNeedPasscode,
+    cleanup_tree,
+    find_tdata_root,
+    import_tdata_to_session,
+)
 from telethon.errors import ChatAdminRequiredError
 from telethon_join import (
     join_chat_or_channel_by_link,
@@ -138,7 +147,8 @@ def _chats_intro_long(context: ContextTypes.DEFAULT_TYPE) -> str:
         "<b>🔗 Вступить по ссылке</b> — вступить в группу (если ещё не внутри); "
         "группа добавится в список источников.\n"
         "Строка: ✅/❌ — вкл/выкл источник · <b>📋</b> — <b>парс в очередь</b> (этот чат) · ⚙ — полные настройки.\n"
-        "<b>Кнопка «Из ЛС»</b> — контакты из личных чатов в очередь <b>первого</b> источника с ✅.\n"
+        "<b>📇 Контакты → общий пул</b> — адресная книга текущей сессии в общую очередь (между слотами).\n"
+        "<b>Кнопка «Из ЛС»</b> — пользователи из личных диалогов в очередь <b>первого</b> источника с ✅.\n"
         "<b>В ⚙</b> — «Из 15k сообщений»: отправители из последних сообщений этой группы.\n"
         "Уже кому писали — в очередь не попадают; при отправке снимаются из очереди.\n"
         "<i>Нужны права админа (или доступ к списку участников), иначе парс не сработает.</i>"
@@ -190,17 +200,28 @@ async def _ls_mail_text_kb(
     for pid in ls_source_peer_ids(state):
         if state.cfg(pid).enabled:
             pend += len(state.cfg(pid).dm_pending_user_ids or [])
+    multi = context.bot_data["multi"]
+    pool_p = len(multi.shared_dm_pending_user_ids or [])
+    pool_s = len(multi.shared_dm_sent_user_ids or [])
+    pool_on = "✅" if multi.shared_pool_mailing else "❌"
     label = "⏹ Остановить ЛС" if state.spam_running else "▶ Запустить ЛС"
     body = (
         f"<b>Рассылка в ЛС</b> · слот <code>{_esc(aid)}</code>\n\n"
         f"{line}\n"
         f"Статус: <b>{sp}</b>\n"
-        f"Источников с ✅: <b>{n_on}</b> · в очереди всего: <b>{pend}</b>\n\n"
-        "<i>Очередь: «Парс» → ⚙ у источника → «Парс → очередь ЛС».</i>"
+        f"Источников с ✅: <b>{n_on}</b> · в очереди источников: <b>{pend}</b>\n"
+        f"<b>Общий пул</b> (контакты): {pool_on} · ждут: <b>{pool_p}</b> · уже писали: <b>{pool_s}</b>\n\n"
+        "<i>Контакты: «Парс» → «📇 Контакты → общий пул». Рассылка по пулу — кнопка ниже.</i>"
     )
     kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(label, callback_data="spam")],
+            [
+                InlineKeyboardButton(
+                    f"{'⏸' if multi.shared_pool_mailing else '▶'} Пул контактов",
+                    callback_data="shpool",
+                )
+            ],
             [InlineKeyboardButton("📋 К парсу (источники)", callback_data="chats0")],
             [InlineKeyboardButton("◀ Главное меню", callback_data="home")],
         ]
@@ -225,7 +246,7 @@ async def _accounts_pick_text_async(
         "<b>Аккаунты</b>\n"
         "Нажмите слот: <b>🔴</b> — вход (номер → код → пароль 2FA), "
         "<b>🟢</b> — переключить на этот слот.\n"
-        "Можно добавить слот вручную или импортировать файл <code>.session</code>.\n\n"
+        "Можно добавить слот вручную, импортировать <code>.session</code> или архив <code>tdata</code> (zip).\n\n"
         + "\n".join(lines)
     )
 
@@ -237,7 +258,12 @@ def _accounts_pick_kb(account_order: list[str], active_id: str) -> InlineKeyboar
         label = f"{prefix}{aid}"[:60]
         rows.append([InlineKeyboardButton(label, callback_data=f"acc:{aid}")])
     rows.append([InlineKeyboardButton("➕ Новый слот", callback_data="accadd")])
-    rows.append([InlineKeyboardButton("📥 Импорт .session", callback_data="accimport")])
+    rows.append(
+        [
+            InlineKeyboardButton("📥 .session", callback_data="accimport"),
+            InlineKeyboardButton("📂 tdata (zip)", callback_data="accimporttdata"),
+        ]
+    )
     rows.append([InlineKeyboardButton("🗑 Удалить слот", callback_data="accdelmenu")])
     rows.append([InlineKeyboardButton("◀ Меню", callback_data="home")])
     return InlineKeyboardMarkup(rows)
@@ -293,6 +319,7 @@ async def _after_telethon_sign_in(
         multi.accounts[aid],
         persist=lambda: save_multi_account_state(multi),
         account_key=aid,
+        multi=multi,
     )
     me = await client.get_me()
     multi.active_account_id = aid
@@ -663,6 +690,14 @@ def chats_kb(
             InlineKeyboardButton(
                 f"📋 Парс в очередь (все ✅ · {n_on})",
                 callback_data=f"lsprall{page}",
+            )
+        ]
+    )
+    btns.append(
+        [
+            InlineKeyboardButton(
+                "📇 Контакты → общий пул",
+                callback_data=f"lsprct{page}",
             )
         ]
     )
@@ -1084,6 +1119,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    if data == "accimporttdata":
+        context.user_data.pop("tdata_pending", None)
+        context.user_data["wait"] = ("accimporttdata",)
+        await q.answer()
+        await q.edit_message_text(
+            "<b>Импорт из Telegram Desktop (tdata)</b>\n\n"
+            "Пришлите <b>zip-архив</b> с папкой <code>tdata</code> (как документ).\n"
+            "Имя архива задаёт id слота: <code>acc1.zip</code> → <code>acc1</code>.\n"
+            "Если в Telegram Desktop стоит локальный пароль — после загрузки бот запросит его.\n\n"
+            "<i>На Windows: папка %APPDATA%\\Telegram Desktop\\tdata</i>",
+            parse_mode=PARSE,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("◀ К аккаунтам", callback_data="accpick")]]
+            ),
+        )
+        return
+
     if data == "accdelmenu":
         multi = context.bot_data["multi"]
         if not multi.account_order:
@@ -1231,6 +1283,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 multi.accounts[new_id],
                 persist=lambda: save_multi_account_state(multi),
                 account_key=new_id,
+                multi=multi,
             )
         if not await client.is_user_authorized():
             context.user_data["wait"] = ("tauth_phone", new_id)
@@ -1422,6 +1475,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _edit_cb_message(q, text=t, reply_markup=kb, parse_mode=PARSE)
         return
 
+    if data == "shpool":
+        multi = context.bot_data["multi"]
+        multi.shared_pool_mailing = not multi.shared_pool_mailing
+        _persist(context)
+        await q.answer(
+            "Рассылка по общему пулу: "
+            + ("включена" if multi.shared_pool_mailing else "выключена")
+        )
+        t, kb = await _ls_mail_text_kb(state, online, context)
+        await _edit_cb_message(q, text=t, reply_markup=kb, parse_mode=PARSE)
+        return
+
     if data == "spam":
         slot = context.bot_data["multi"].active_account_id
         if state.spam_running:
@@ -1437,7 +1502,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 parse_mode=PARSE,
             )
             return
-        ok, err = validate_spam_start(state, online)
+        ok, err = validate_spam_start(state, online, context.bot_data["multi"])
         if not ok:
             await q.answer(_plain_alert(err), show_alert=True)
             return
@@ -1485,6 +1550,42 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await q.answer(
             f"15k: +{added} в очередь (всего {total})", show_alert=False
         )
+        return
+
+    m = re.match(r"^lsprct(\d+)$", data)
+    if m:
+        page = int(m.group(1))
+        if not online or tc is None:
+            await q.answer("Userbot офлайн.", show_alert=True)
+            return
+        multi = context.bot_data["multi"]
+        try:
+            added, total = await parse_contacts_into_shared_pool(
+                tc, multi, lambda: _persist(context)
+            )
+        except Exception as e:
+            logger.exception("parse_contacts_into_shared_pool")
+            await q.answer(type(e).__name__, show_alert=True)
+            return
+        try:
+            if online and tc is not None:
+                rows = await _rows_for_sources_ui(context, force_refresh_titles=False)
+            else:
+                rows = _ls_rows_sync(state)
+        except Exception:
+            rows = _ls_rows_sync(state)
+        await _edit_cb_message(
+            q,
+            text=(
+                f"{_chats_intro_long(context)}\n\n"
+                f"<b>Контакты сессии</b> → общий пул: +<b>{added}</b> новых, "
+                f"в пуле ждут рассылки: <b>{total}</b>.\n"
+                f"Уже кому писали — не добавляются; после отправки убираются из пула."
+            ),
+            reply_markup=chats_kb(rows, page, state),
+            parse_mode=PARSE,
+        )
+        await q.answer()
         return
 
     m = re.match(r"^lsprls(\d+)$", data)
@@ -2319,6 +2420,84 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await q.answer()
 
 
+async def _try_tdata_import_zip(
+    msg,
+    context: ContextTypes.DEFAULT_TYPE,
+    aid: str,
+    zip_path: str,
+    *,
+    passcode: str | None = None,
+) -> bool:
+    """True если импорт завершён (успех или фatal ошибка с сообщением)."""
+    import zipfile
+
+    multi: MultiAccountState = context.bot_data["multi"]
+    extract_dir = os.path.join(os.path.dirname(__file__), "tdata_uploads", aid)
+    cleanup_tree(extract_dir)
+    os.makedirs(extract_dir, exist_ok=True)
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(extract_dir)
+    except Exception as e:
+        await msg.reply_text(f"Не удалось распаковать zip: {_esc(e)}", parse_mode=PARSE)
+        cleanup_tree(extract_dir)
+        return True
+
+    troot = find_tdata_root(Path(extract_dir))
+    if troot is None:
+        await msg.reply_text(
+            "В архиве не найдена папка <code>tdata</code> (файл <code>key_datas</code>).",
+            parse_mode=PARSE,
+        )
+        cleanup_tree(extract_dir)
+        return True
+
+    session_base = session_path(aid)
+    api_id = int(os.environ["API_ID"])
+    api_hash = os.environ["API_HASH"]
+    try:
+        await import_tdata_to_session(
+            troot,
+            session_base,
+            api_id=api_id,
+            api_hash=api_hash,
+            passcode=passcode,
+        )
+    except TDataNeedPasscode:
+        context.user_data["tdata_pending"] = {
+            "aid": aid,
+            "extract_dir": extract_dir,
+            "zip_path": zip_path,
+        }
+        context.user_data["wait"] = ("acctdatapw", aid)
+        await msg.reply_text(
+            "tdata защищён локальным паролем Telegram Desktop.\n"
+            "Пришлите пароль одним сообщением (или <code>-</code> если пароля нет).",
+            parse_mode=PARSE,
+        )
+        return True
+    except TDataImportError as e:
+        await msg.reply_text(f"Импорт tdata: {_esc(e)}", parse_mode=PARSE)
+        cleanup_tree(extract_dir)
+        return True
+    except Exception as e:
+        logger.exception("import_tdata_to_session")
+        await msg.reply_text(f"Ошибка tdata: {_esc(type(e).__name__)}", parse_mode=PARSE)
+        cleanup_tree(extract_dir)
+        return True
+
+    cleanup_tree(extract_dir)
+    context.user_data.pop("tdata_pending", None)
+    context.user_data.pop("wait", None)
+    await _connect_imported_slot(
+        msg,
+        context,
+        aid,
+        success_prefix="✅ tdata импортирован.",
+    )
+    return True
+
+
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     admins: set[int] = context.bot_data["admin_ids"]
     if not _is_admin_m(update, admins):
@@ -2329,8 +2508,48 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     w = context.user_data.get("wait")
+    waiting_tdata = isinstance(w, tuple) and len(w) >= 1 and w[0] == "accimporttdata"
     waiting_import = isinstance(w, tuple) and len(w) >= 1 and w[0] == "accimport"
     filename = (doc.file_name or "").strip()
+
+    if waiting_tdata or filename.lower().endswith(".zip"):
+        if not filename.lower().endswith(".zip"):
+            if waiting_tdata:
+                await msg.reply_text("Нужен zip-архив с папкой tdata.", parse_mode=PARSE)
+            return
+        stem = filename.rsplit(".", 1)[0].strip()
+        raw_aid = _parse_new_account_id(stem) or _parse_session_account_id(f"{stem}.session")
+        if not raw_aid:
+            await msg.reply_text(
+                "Задайте id слота именем архива, например <code>shop2.zip</code>.",
+                parse_mode=PARSE,
+            )
+            return
+        multi: MultiAccountState = context.bot_data["multi"]
+        aid = _next_free_account_id(multi, raw_aid)
+        if not aid:
+            await msg.reply_text("Не удалось подобрать свободный id слота.")
+            return
+        tmp_zip = os.path.join(
+            os.path.dirname(__file__), "tdata_uploads", f"{aid}.upload.zip"
+        )
+        os.makedirs(os.path.dirname(tmp_zip), exist_ok=True)
+        try:
+            f = await context.bot.get_file(doc.file_id)
+            await f.download_to_drive(custom_path=tmp_zip)
+        except Exception as e:
+            await msg.reply_text(f"Не удалось скачать архив: {_esc(e)}", parse_mode=PARSE)
+            return
+        if not waiting_tdata:
+            context.user_data["wait"] = ("accimporttdata",)
+        await _try_tdata_import_zip(msg, context, aid, tmp_zip)
+        try:
+            if os.path.isfile(tmp_zip):
+                os.remove(tmp_zip)
+        except OSError:
+            pass
+        return
+
     if not filename.lower().endswith(".session"):
         if waiting_import:
             await msg.reply_text("Нужен файл с расширением <code>.session</code>.", parse_mode=PARSE)
@@ -2408,6 +2627,7 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         multi.accounts[aid],
         persist=lambda: save_multi_account_state(multi),
         account_key=aid,
+        multi=multi,
     )
 
     try:
@@ -2435,6 +2655,77 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await msg.reply_text(
         f"Файл сохранён, слот <code>{_esc(aid)}</code> добавлен, но сессия не авторизована.\n"
         "Откройте «Аккаунты» и нажмите этот слот для входа по номеру.",
+        parse_mode=PARSE,
+    )
+
+
+async def _connect_imported_slot(
+    msg,
+    context: ContextTypes.DEFAULT_TYPE,
+    aid: str,
+    *,
+    success_prefix: str,
+) -> None:
+    multi: MultiAccountState = context.bot_data["multi"]
+    if aid not in multi.accounts:
+        multi.accounts[aid] = RuntimeState()
+    if aid not in multi.account_order:
+        multi.account_order.append(aid)
+    _persist(context)
+
+    clients: dict = context.bot_data["telethon_clients"]
+    api_id = int(os.environ["API_ID"])
+    api_hash = os.environ["API_HASH"]
+    client = make_telethon_client(
+        aid,
+        api_id,
+        api_hash,
+        proxy_raw=multi.accounts[aid].proxy,
+    )
+    try:
+        client = await connect_client_with_fallback(
+            client,
+            account_id=aid,
+            api_id=api_id,
+            api_hash=api_hash,
+            proxy_raw=multi.accounts[aid].proxy,
+            allow_direct_fallback=False,
+        )
+    except Exception as e:
+        await msg.reply_text(
+            f"Слот <code>{_esc(aid)}</code> создан, но подключение не удалось: {_esc(e)}.",
+            parse_mode=PARSE,
+        )
+        return
+
+    clients[aid] = client
+    start_spam_loop_background(
+        client,
+        multi.accounts[aid],
+        persist=lambda: save_multi_account_state(multi),
+        account_key=aid,
+        multi=multi,
+    )
+    try:
+        is_auth = await client.is_user_authorized()
+    except Exception:
+        is_auth = False
+    if not is_auth:
+        await msg.reply_text(
+            f"Слот <code>{_esc(aid)}</code> сохранён, но сессия не авторизована.",
+            parse_mode=PARSE,
+        )
+        return
+    multi.active_account_id = aid
+    context.bot_data["state"] = multi.accounts[aid]
+    context.bot_data["telethon_client"] = client
+    _persist(context)
+    me = await client.get_me()
+    on = await _telethon_ready(client)
+    ht, kb = await _home_text_kb(multi.accounts[aid], on, context)
+    await msg.reply_text(
+        f"{success_prefix} @{_esc(me.username or str(me.id))} · слот <code>{_esc(aid)}</code>.\n\n{ht}",
+        reply_markup=kb,
         parse_mode=PARSE,
     )
 
@@ -2474,6 +2765,65 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ok, msg = await _yod_run_double_start(tc, uname=uname)
         context.user_data.pop("wait", None)
         await update.message.reply_text(msg, parse_mode=PARSE)
+        return
+
+    if kind == "acctdatapw":
+        pending = context.user_data.get("tdata_pending") or {}
+        aid = str(pending.get("aid") or (w[1] if len(w) > 1 else "")).strip()
+        extract_dir = pending.get("extract_dir")
+        zip_path = pending.get("zip_path")
+        if not aid or not extract_dir:
+            context.user_data.pop("wait", None)
+            context.user_data.pop("tdata_pending", None)
+            await update.message.reply_text("Нет активной загрузки tdata. Начните импорт заново.")
+            return
+        troot = find_tdata_root(Path(str(extract_dir)))
+        if troot is None:
+            context.user_data.pop("wait", None)
+            context.user_data.pop("tdata_pending", None)
+            await update.message.reply_text("Папка tdata не найдена. Загрузите zip снова.")
+            return
+        pw = None if text in ("-", "") else text
+        session_base = session_path(aid)
+        api_id = int(os.environ["API_ID"])
+        api_hash = os.environ["API_HASH"]
+        try:
+            await import_tdata_to_session(
+                troot,
+                session_base,
+                api_id=api_id,
+                api_hash=api_hash,
+                passcode=pw,
+            )
+        except TDataNeedPasscode:
+            await update.message.reply_text(
+                "Пароль не подошёл. Пришлите снова или загрузите zip заново.",
+                parse_mode=PARSE,
+            )
+            return
+        except TDataImportError as e:
+            context.user_data.pop("wait", None)
+            context.user_data.pop("tdata_pending", None)
+            await update.message.reply_text(f"Импорт tdata: {_esc(e)}", parse_mode=PARSE)
+            return
+        except Exception as e:
+            logger.exception("acctdatapw import")
+            await update.message.reply_text(f"Ошибка: {_esc(type(e).__name__)}", parse_mode=PARSE)
+            return
+        cleanup_tree(extract_dir)
+        context.user_data.pop("tdata_pending", None)
+        context.user_data.pop("wait", None)
+        try:
+            if zip_path and os.path.isfile(str(zip_path)):
+                os.remove(str(zip_path))
+        except OSError:
+            pass
+        await _connect_imported_slot(
+            update.message,
+            context,
+            aid,
+            success_prefix="✅ tdata импортирован.",
+        )
         return
 
     if kind == "tauth_phone":
@@ -2679,6 +3029,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 multi.accounts[new_id],
                 persist=lambda: save_multi_account_state(multi),
                 account_key=new_id,
+                multi=multi,
             )
             logger.info("Новый слот %s: клиент подключён, spam_loop запланирован.", new_id)
         context.user_data.pop("wait", None)
